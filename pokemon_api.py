@@ -13,13 +13,11 @@ app = Flask(__name__)
 
 POKEAPI = "https://pokeapi.co/api/v2/pokemon?limit=1025"
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
-supabase = create_client(
-    SUPABASE_URL,
-    SUPABASE_KEY
-)
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL ou SUPABASE_KEY não configurada no Render")
 
 _cache = None
 
