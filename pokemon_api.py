@@ -1,9 +1,9 @@
 from flask import Flask, Response
 import random
 import requests
-import sqlite3
 import os
 from urllib.parse import unquote
+from supabase import create_client
 
 app = Flask(__name__)
 
@@ -13,8 +13,13 @@ app = Flask(__name__)
 
 POKEAPI = "https://pokeapi.co/api/v2/pokemon?limit=1025"
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(BASE_DIR, "pokemon.db")
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+
+supabase = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY
+)
 
 _cache = None
 
@@ -46,45 +51,8 @@ RARITY_LABEL = {
 
 
 # ============================================================
-# BANCO DE DADOS
+# BANCO DE DADOS — SUPABASE
 # ============================================================
-
-def get_db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = get_db()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trainers (
-            username TEXT PRIMARY KEY,
-            captures INTEGER DEFAULT 0,
-            wins INTEGER DEFAULT 0,
-            losses INTEGER DEFAULT 0,
-            battles INTEGER DEFAULT 0
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS collection (
-            username TEXT NOT NULL,
-            pokemon TEXT NOT NULL,
-            rarity TEXT NOT NULL,
-            amount INTEGER DEFAULT 1,
-            PRIMARY KEY (username, pokemon)
-        )
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
 
 def ensure_trainer(username):
     username = username.strip()
@@ -92,19 +60,68 @@ def ensure_trainer(username):
     if not username:
         username = "Treinador"
 
-    conn = get_db()
-
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO trainers
-        (username, captures, wins, losses, battles)
-        VALUES (?, 0, 0, 0, 0)
-        """,
-        (username,)
+    existing = (
+        supabase.table("trainers")
+        .select("username")
+        .eq("username", username)
+        .execute()
     )
 
-    conn.commit()
-    conn.close()
+    if not existing.data:
+        supabase.table("trainers").insert({
+            "username": username,
+            "capture": 0,
+            "wins": 0,
+            "losses": 0,
+            "battles": 0
+        }).execute()
+
+
+def save_capture(username, pokemon, rarity):
+    ensure_trainer(username)
+
+    trainer = (
+        supabase.table("trainers")
+        .select("capture")
+        .eq("username", username)
+        .single()
+        .execute()
+    )
+
+    current_capture = trainer.data["capture"] or 0
+
+    supabase.table("trainers").update({
+        "capture": current_capture + 1
+    }).eq(
+        "username", username
+    ).execute()
+
+    existing = (
+        supabase.table("collection")
+        .select("amount")
+        .eq("username", username)
+        .eq("pokemon", pokemon)
+        .execute()
+    )
+
+    if existing.data:
+        current_amount = existing.data[0]["amount"] or 0
+
+        supabase.table("collection").update({
+            "amount": current_amount + 1
+        }).eq(
+            "username", username
+        ).eq(
+            "pokemon", pokemon
+        ).execute()
+
+    else:
+        supabase.table("collection").insert({
+            "username": username,
+            "pokemon": pokemon,
+            "rarity": rarity,
+            "amount": 1
+        }).execute()
 
 
 # ============================================================
@@ -135,8 +152,6 @@ def load_species():
         except Exception:
             continue
 
-        # Distribuição determinística de raridade.
-        # Isso evita centenas de requisições à PokéAPI.
         if pokemon_id % 100 == 0:
             rarity = "mitico"
         elif pokemon_id % 50 == 0:
@@ -189,36 +204,6 @@ def pick_pokemon(rarity):
 # CAPTURA
 # ============================================================
 
-def save_capture(username, pokemon, rarity):
-    ensure_trainer(username)
-
-    conn = get_db()
-
-    conn.execute(
-        """
-        UPDATE trainers
-        SET captures = captures + 1
-        WHERE username = ?
-        """,
-        (username,)
-    )
-
-    conn.execute(
-        """
-        INSERT INTO collection
-        (username, pokemon, rarity, amount)
-        VALUES (?, ?, ?, 1)
-
-        ON CONFLICT(username, pokemon)
-        DO UPDATE SET amount = amount + 1
-        """,
-        (username, pokemon, rarity)
-    )
-
-    conn.commit()
-    conn.close()
-
-
 def make_result(user):
     ensure_trainer(user)
 
@@ -228,10 +213,7 @@ def make_result(user):
     chance = CAPTURE_CHANCES[rarity]
     roll = random.random()
 
-    # 5% de chance de captura crítica
     critical = random.random() < 0.05
-
-    # 22% de chance de contra-ataque
     counter = random.random() < 0.22
 
     captured = False
@@ -323,19 +305,14 @@ def pokemons(user):
 
     ensure_trainer(user)
 
-    conn = get_db()
+    response = (
+        supabase.table("collection")
+        .select("pokemon, rarity, amount")
+        .eq("username", user)
+        .execute()
+    )
 
-    rows = conn.execute(
-        """
-        SELECT pokemon, rarity, amount
-        FROM collection
-        WHERE username = ?
-        ORDER BY rarity, pokemon
-        """,
-        (user,)
-    ).fetchall()
-
-    conn.close()
+    rows = response.data
 
     if not rows:
         return Response(
@@ -385,61 +362,48 @@ def perfil(user):
 
     ensure_trainer(user)
 
-    conn = get_db()
+    trainer_response = (
+        supabase.table("trainers")
+        .select("*")
+        .eq("username", user)
+        .single()
+        .execute()
+    )
 
-    trainer = conn.execute(
-        """
-        SELECT *
-        FROM trainers
-        WHERE username = ?
-        """,
-        (user,)
-    ).fetchone()
+    trainer = trainer_response.data
 
-    unique = conn.execute(
-        """
-        SELECT COUNT(*)
-        FROM collection
-        WHERE username = ?
-        """,
-        (user,)
-    ).fetchone()[0]
+    collection_response = (
+        supabase.table("collection")
+        .select("pokemon, rarity, amount")
+        .eq("username", user)
+        .execute()
+    )
 
-    rare = conn.execute(
-        """
-        SELECT COALESCE(SUM(amount), 0)
-        FROM collection
-        WHERE username = ?
-        AND rarity = 'raro'
-        """,
-        (user,)
-    ).fetchone()[0]
+    rows = collection_response.data
 
-    legendary = conn.execute(
-        """
-        SELECT COALESCE(SUM(amount), 0)
-        FROM collection
-        WHERE username = ?
-        AND rarity = 'lendario'
-        """,
-        (user,)
-    ).fetchone()[0]
+    unique = len(rows)
 
-    mythical = conn.execute(
-        """
-        SELECT COALESCE(SUM(amount), 0)
-        FROM collection
-        WHERE username = ?
-        AND rarity = 'mitico'
-        """,
-        (user,)
-    ).fetchone()[0]
+    rare = sum(
+        row["amount"]
+        for row in rows
+        if row["rarity"] == "raro"
+    )
 
-    conn.close()
+    legendary = sum(
+        row["amount"]
+        for row in rows
+        if row["rarity"] == "lendario"
+    )
+
+    mythical = sum(
+        row["amount"]
+        for row in rows
+        if row["rarity"] == "mitico"
+    )
 
     result = (
         f"👤 PERFIL DE {user} | "
-        f"🎒 Pokémon: {trainer['captures']} | "
+        f"🎒 Pokémon: {trainer['capture']} | "
         f"📖 Espécies: {unique} | "
         f"🟣 Raros: {rare} | "
         f"🟡 Lendários: {legendary} | "
@@ -475,47 +439,40 @@ def batalha(user, opponent):
     ensure_trainer(user)
     ensure_trainer(opponent)
 
-    conn = get_db()
+    user_response = (
+        supabase.table("collection")
+        .select("pokemon, rarity")
+        .eq("username", user)
+        .execute()
+    )
 
-    user_pokemon = conn.execute(
-        """
-        SELECT pokemon, rarity
-        FROM collection
-        WHERE username = ?
-        ORDER BY RANDOM()
-        LIMIT 1
-        """,
-        (user,)
-    ).fetchone()
+    opponent_response = (
+        supabase.table("collection")
+        .select("pokemon, rarity")
+        .eq("username", opponent)
+        .execute()
+    )
 
-    opponent_pokemon = conn.execute(
-        """
-        SELECT pokemon, rarity
-        FROM collection
-        WHERE username = ?
-        ORDER BY RANDOM()
-        LIMIT 1
-        """,
-        (opponent,)
-    ).fetchone()
+    user_collection = user_response.data
+    opponent_collection = opponent_response.data
 
-    conn.close()
-
-    if not user_pokemon:
+    if not user_collection:
         return Response(
             f"⚠️ {user} ainda não tem Pokémon "
             f"para batalhar!",
             mimetype="text/plain; charset=utf-8"
         )
 
-    if not opponent_pokemon:
+    if not opponent_collection:
         return Response(
             f"⚠️ {opponent} ainda não tem Pokémon "
             f"para batalhar!",
             mimetype="text/plain; charset=utf-8"
         )
 
-    # Pequena vantagem baseada na raridade
+    user_pokemon = random.choice(user_collection)
+    opponent_pokemon = random.choice(opponent_collection)
+
     rarity_power = {
         "comum": 1,
         "incomum": 2,
@@ -545,37 +502,61 @@ def batalha(user, opponent):
         winner_pokemon = opponent_pokemon["pokemon"]
         loser_pokemon = user_pokemon["pokemon"]
 
-    conn = get_db()
-
-    conn.execute(
-        """
-        UPDATE trainers
-        SET battles = battles + 1
-        WHERE username IN (?, ?)
-        """,
-        (user, opponent)
+    user_trainer = (
+        supabase.table("trainers")
+        .select("battles")
+        .eq("username", user)
+        .single()
+        .execute()
     )
 
-    conn.execute(
-        """
-        UPDATE trainers
-        SET wins = wins + 1
-        WHERE username = ?
-        """,
-        (winner,)
+    opponent_trainer = (
+        supabase.table("trainers")
+        .select("battles")
+        .eq("username", opponent)
+        .single()
+        .execute()
     )
 
-    conn.execute(
-        """
-        UPDATE trainers
-        SET losses = losses + 1
-        WHERE username = ?
-        """,
-        (loser,)
+    supabase.table("trainers").update({
+        "battles": (user_trainer.data["battles"] or 0) + 1
+    }).eq(
+        "username", user
+    ).execute()
+
+    supabase.table("trainers").update({
+        "battles": (opponent_trainer.data["battles"] or 0) + 1
+    }).eq(
+        "username", opponent
+    ).execute()
+
+    winner_data = (
+        supabase.table("trainers")
+        .select("wins")
+        .eq("username", winner)
+        .single()
+        .execute()
     )
 
-    conn.commit()
-    conn.close()
+    loser_data = (
+        supabase.table("trainers")
+        .select("losses")
+        .eq("username", loser)
+        .single()
+        .execute()
+    )
+
+    supabase.table("trainers").update({
+        "wins": (winner_data.data["wins"] or 0) + 1
+    }).eq(
+        "username", winner
+    ).execute()
+
+    supabase.table("trainers").update({
+        "losses": (loser_data.data["losses"] or 0) + 1
+    }).eq(
+        "username", loser
+    ).execute()
 
     result = (
         f"⚔️ BATALHA! {user} "
@@ -597,18 +578,23 @@ def batalha(user, opponent):
 
 @app.get("/top")
 def top():
-    conn = get_db()
+    response = (
+        supabase.table("trainers")
+        .select("username, capture, wins")
+        .execute()
+    )
 
-    rows = conn.execute(
-        """
-        SELECT username, captures, wins
-        FROM trainers
-        ORDER BY captures DESC, wins DESC
-        LIMIT 10
-        """
-    ).fetchall()
+    rows = response.data
 
-    conn.close()
+    rows.sort(
+        key=lambda row: (
+            row["capture"] or 0,
+            row["wins"] or 0
+        ),
+        reverse=True
+    )
+
+    rows = rows[:10]
 
     if not rows:
         return Response(
@@ -621,7 +607,7 @@ def top():
     for i, row in enumerate(rows, start=1):
         ranking.append(
             f"{i}º {row['username']} "
-            f"— 🎒 {row['captures']} Pokémon "
+            f"— 🎒 {row['capture']} Pokémon "
             f"— 🏆 {row['wins']} vitórias"
         )
 
@@ -647,11 +633,11 @@ def home():
 
 
 # ============================================================
-# EXECUÇÃO LOCAL
+# EXECUÇÃO
 # ============================================================
 
 if __name__ == "__main__":
     app.run(
         host="0.0.0.0",
         port=8080
-    )
+)
