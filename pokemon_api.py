@@ -282,10 +282,17 @@ def make_result(user):
 
 @app.get("/pokemon")
 def pokemon():
-    return Response(
-        make_result("O treinador"),
-        mimetype="text/plain; charset=utf-8"
-    )
+    try:
+        return Response(
+            make_result("O treinador"),
+            mimetype="text/plain; charset=utf-8"
+        )
+    except Exception as e:
+        return Response(
+            f"ERRO: {type(e).__name__}: {e}",
+            status=500,
+            mimetype="text/plain; charset=utf-8"
+        )
 
 
 @app.get("/pokemon/<user>")
